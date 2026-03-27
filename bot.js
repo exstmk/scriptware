@@ -13,6 +13,7 @@
 //    !help
 // ═══════════════════════════════════════════════════════════════════
 
+// Sigmahacks Whitelist Bot
 const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const https = require("https");
 const http  = require("http");
