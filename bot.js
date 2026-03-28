@@ -1,19 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════
 //  bot.js — Sigmahacks Whitelist Discord Bot (Railway)
 //
-//  Commands (DM the bot):
-//    !adduser <user> <pass>
-//    !removeuser <user>
-//    !setpass <user> <newpass>
-//    !deactivate <user>        ← ban without deleting
-//    !activate <user>          ← re-enable a deactivated user
-//    !listusers
-//    !checkuser <user>
-//    !showpass <user>
-//    !help
+//  Owner commands (only your OWNER_ID):
+//    !adduser <user> <pass>       — whitelist a user
+//    !removeuser <user>           — remove a user
+//    !setpass <user> <newpass>    — change a password
+//    !listusers                   — list all users
+//    !checkuser <user>            — check if user exists
+//    !admin add <@user or ID>     — give someone admin perms
+//    !admin remove <@user or ID>  — remove someone's admin perms
+//    !admin list                  — show all admins
+//
+//  Admin commands (users granted by owner via !admin add):
+//    !adduser, !removeuser, !checkuser, !listusers
+//    (admins CANNOT use !setpass or !admin)
 // ═══════════════════════════════════════════════════════════════════
 
-// Sigmahacks Whitelist Bot
 const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const https = require("https");
 const http  = require("http");
@@ -24,9 +26,27 @@ const WORKER_URL    = (process.env.WORKER_URL ?? "").replace(/\/$/, "");
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
 if (!BOT_TOKEN || !OWNER_ID || !WORKER_URL || !WORKER_SECRET) {
-    console.error("❌ Missing environment variables.");
+    console.error("❌ Missing environment variables. Check Railway settings.");
     process.exit(1);
 }
+
+// ── Admin list (stored in Cloudflare KV under key __admins) ───────────
+// We reuse the same KV via the worker so no extra storage needed.
+
+async function getAdmins() {
+    try {
+        const data = await workerGet("/admins");
+        return Array.isArray(data.admins) ? data.admins : [];
+    } catch { return []; }
+}
+
+async function setAdmins(admins) {
+    return await post("/admins", { admins });
+}
+
+function isOwner(id)       { return id === OWNER_ID; }
+async function isAdmin(id) { const admins = await getAdmins(); return admins.includes(id); }
+async function canManage(id) { return isOwner(id) || await isAdmin(id); }
 
 // ── HTTP helper ───────────────────────────────────────────────────────
 function workerRequest(method, path, body = null) {
@@ -51,8 +71,8 @@ function workerRequest(method, path, body = null) {
     });
 }
 
-const get  = path         => workerRequest("GET",  path);
-const post = (path, body) => workerRequest("POST", path, body);
+const workerGet = path        => workerRequest("GET",  path);
+const post      = (path, body) => workerRequest("POST", path, body);
 
 // ── Embed helper ──────────────────────────────────────────────────────
 function embed(title, desc, color = 0x4a9eff) {
@@ -69,38 +89,54 @@ const RED    = 0xdc4646;
 const YELLOW = 0xdcb43c;
 const BLUE   = 0x4a9eff;
 const PURPLE = 0x9b59b6;
-const ORANGE = 0xe67e22;
+
+// ── Parse a user ID from a mention or raw ID ──────────────────────────
+function parseUserId(str) {
+    if (!str) return null;
+    // Strip mention formatting <@123456> or <@!123456>
+    const match = str.match(/^<@!?(\d+)>$/) || str.match(/^(\d+)$/);
+    return match ? match[1] : null;
+}
 
 // ── Commands ──────────────────────────────────────────────────────────
 const COMMANDS = {
 
-    // !adduser <user> <pass>
+    // !adduser <user> <pass>  — owner + admin
     adduser: async (msg, args) => {
-        if (args.length < 2) return msg.reply("Usage: `!adduser <username> <password>`");
+        if (!await canManage(msg.author.id))
+            return msg.reply({ embeds: [embed("No Permission", "You don't have permission to do that.", RED)] });
+        if (args.length < 2)
+            return msg.reply("Usage: `!adduser <username> <password>`");
         const [user, pass] = [args[0], args.slice(1).join(" ")];
         const data = await post("/add", { user, pass });
         if (data.ok)
-            return msg.reply({ embeds: [embed("✅ User Added", `**${user}** has been added to the whitelist.`, GREEN)] });
+            return msg.reply({ embeds: [embed("✅ User Added", `**${user}** added to whitelist.`, GREEN)] });
         if (data.error === "already_exists")
             return msg.reply({ embeds: [embed("Already Exists", `**${user}** is already whitelisted.`, RED)] });
         return msg.reply({ embeds: [embed("Error", data.error ?? "Unknown error", RED)] });
     },
 
-    // !removeuser <user>
+    // !removeuser <user>  — owner + admin
     removeuser: async (msg, args) => {
-        if (args.length < 1) return msg.reply("Usage: `!removeuser <username>`");
+        if (!await canManage(msg.author.id))
+            return msg.reply({ embeds: [embed("No Permission", "You don't have permission to do that.", RED)] });
+        if (args.length < 1)
+            return msg.reply("Usage: `!removeuser <username>`");
         const user = args[0];
         const data = await post("/remove", { user });
         if (data.ok)
-            return msg.reply({ embeds: [embed("🗑️ Removed", `**${user}** has been permanently removed.`, YELLOW)] });
+            return msg.reply({ embeds: [embed("🗑️ Removed", `**${user}** removed from whitelist.`, YELLOW)] });
         if (data.error === "not_found")
             return msg.reply({ embeds: [embed("Not Found", `**${user}** is not whitelisted.`, RED)] });
         return msg.reply({ embeds: [embed("Error", data.error ?? "Unknown error", RED)] });
     },
 
-    // !setpass <user> <newpass>
+    // !setpass <user> <newpass>  — owner only
     setpass: async (msg, args) => {
-        if (args.length < 2) return msg.reply("Usage: `!setpass <username> <newpassword>`");
+        if (!isOwner(msg.author.id))
+            return msg.reply({ embeds: [embed("No Permission", "Only the owner can change passwords.", RED)] });
+        if (args.length < 2)
+            return msg.reply("Usage: `!setpass <username> <newpassword>`");
         const [user, pass] = [args[0], args.slice(1).join(" ")];
         const data = await post("/setpass", { user, pass });
         if (data.ok)
@@ -110,97 +146,104 @@ const COMMANDS = {
         return msg.reply({ embeds: [embed("Error", data.error ?? "Unknown error", RED)] });
     },
 
-    // !deactivate <user>
-    // Blocks the user from logging in without deleting them
-    deactivate: async (msg, args) => {
-        if (args.length < 1) return msg.reply("Usage: `!deactivate <username>`");
-        const user = args[0];
-        const data = await post("/deactivate", { user });
-        if (data.ok)
-            return msg.reply({ embeds: [embed("⛔ User Deactivated", `**${user}** has been deactivated and can no longer log in.\nUse \`!activate ${user}\` to re-enable them.`, ORANGE)] });
-        if (data.error === "already_deactivated")
-            return msg.reply({ embeds: [embed("Already Deactivated", `**${user}** is already deactivated.`, YELLOW)] });
-        if (data.error === "not_found")
-            return msg.reply({ embeds: [embed("Not Found", `**${user}** is not whitelisted.`, RED)] });
-        return msg.reply({ embeds: [embed("Error", data.error ?? "Unknown error", RED)] });
-    },
-
-    // !activate <user>
-    // Re-enables a deactivated user
-    activate: async (msg, args) => {
-        if (args.length < 1) return msg.reply("Usage: `!activate <username>`");
-        const user = args[0];
-        const data = await post("/activate", { user });
-        if (data.ok)
-            return msg.reply({ embeds: [embed("✅ User Activated", `**${user}** has been re-activated and can log in again.`, GREEN)] });
-        if (data.error === "not_found")
-            return msg.reply({ embeds: [embed("Not Found", `**${user}** is not whitelisted.`, RED)] });
-        return msg.reply({ embeds: [embed("Error", data.error ?? "Unknown error", RED)] });
-    },
-
-    // !listusers
+    // !listusers  — owner + admin
     listusers: async (msg) => {
-        const data  = await get("/list");
+        if (!await canManage(msg.author.id))
+            return msg.reply({ embeds: [embed("No Permission", "You don't have permission to do that.", RED)] });
+        const data  = await workerGet("/list");
         const users = data.users ?? [];
         if (users.length === 0)
             return msg.reply({ embeds: [embed("Whitelist", "No users whitelisted yet.", YELLOW)] });
-        const lines = users.map((u, i) => {
-            const status = u.deactivated ? "⛔" : "✅";
-            return `\`${i + 1}.\` ${status} **${u.name}**`;
-        }).join("\n");
+        const lines = users.map((u, i) => `\`${i + 1}.\` **${u}**`).join("\n");
         return msg.reply({ embeds: [embed(`📋 Whitelist — ${users.length} user(s)`, lines, BLUE)] });
     },
 
-    // !checkuser <user>
+    // !checkuser <user>  — owner + admin
     checkuser: async (msg, args) => {
-        if (args.length < 1) return msg.reply("Usage: `!checkuser <username>`");
-        const user  = args[0].toLowerCase();
-        const data  = await get("/list");
-        const users = data.users ?? [];
-        const found = users.find(u => u.name.toLowerCase() === user);
-        if (!found)
-            return msg.reply({ embeds: [embed("❌ Not Found", `**${user}** is NOT whitelisted.`, RED)] });
-        if (found.deactivated)
-            return msg.reply({ embeds: [embed("⛔ Deactivated", `**${user}** is whitelisted but currently deactivated.`, ORANGE)] });
-        return msg.reply({ embeds: [embed("✅ Whitelisted", `**${user}** is active and can log in.`, GREEN)] });
+        if (!await canManage(msg.author.id))
+            return msg.reply({ embeds: [embed("No Permission", "You don't have permission to do that.", RED)] });
+        if (args.length < 1)
+            return msg.reply("Usage: `!checkuser <username>`");
+        const user  = args[0];
+        const data  = await workerGet("/list");
+        const users = (data.users ?? []).map(u => u.toLowerCase());
+        if (users.includes(user.toLowerCase()))
+            return msg.reply({ embeds: [embed("✅ Whitelisted", `**${user}** is in the whitelist.`, GREEN)] });
+        return msg.reply({ embeds: [embed("❌ Not Found", `**${user}** is NOT whitelisted.`, RED)] });
     },
 
-    // !showpass <user>
-    showpass: async (msg, args) => {
-        if (args.length < 1) return msg.reply("Usage: `!showpass <username>`");
-        const user = args[0].toLowerCase();
-        const data = await get(`/getpass?user=${encodeURIComponent(user)}`);
-        if (data.error === "not_found" || !data.pass)
-            return msg.reply({ embeds: [embed("Not Found", `**${user}** is not in the whitelist.`, RED)] });
-        try {
-            const dm = await msg.author.createDM();
-            await dm.send({ embeds: [
-                new EmbedBuilder()
-                    .setTitle(`🔐 Password for ${user}`)
-                    .setDescription(`\`\`\`${data.pass}\`\`\``)
-                    .setColor(PURPLE)
-                    .setFooter({ text: "Do not share this — Sigmahacks Whitelist" })
-                    .setTimestamp()
-            ]});
-            if (msg.channel.type !== 1)
-                return msg.reply("📬 Password sent to your DMs.");
-        } catch {
-            return msg.reply("❌ Couldn't DM you. Make sure your DMs are open.");
+    // !admin add/remove/list  — owner only
+    admin: async (msg, args) => {
+        if (!isOwner(msg.author.id))
+            return msg.reply({ embeds: [embed("No Permission", "Only the owner can manage admins.", RED)] });
+
+        const sub = (args[0] ?? "").toLowerCase();
+
+        // !admin list
+        if (sub === "list") {
+            const admins = await getAdmins();
+            if (admins.length === 0)
+                return msg.reply({ embeds: [embed("👑 Admins", "No admins set yet.", YELLOW)] });
+            const lines = admins.map((id, i) => `\`${i + 1}.\` <@${id}> (${id})`).join("\n");
+            return msg.reply({ embeds: [embed(`👑 Admins — ${admins.length}`, lines, PURPLE)] });
         }
+
+        // !admin add <@user or ID>
+        if (sub === "add") {
+            const targetId = parseUserId(args[1]);
+            if (!targetId)
+                return msg.reply("Usage: `!admin add <@user or user ID>`");
+            if (targetId === OWNER_ID)
+                return msg.reply({ embeds: [embed("Already Owner", "That's you — you already have full access.", YELLOW)] });
+            const admins = await getAdmins();
+            if (admins.includes(targetId))
+                return msg.reply({ embeds: [embed("Already Admin", `<@${targetId}> is already an admin.`, YELLOW)] });
+            admins.push(targetId);
+            await setAdmins(admins);
+            return msg.reply({ embeds: [embed("✅ Admin Added", `<@${targetId}> can now use \`!adduser\`, \`!removeuser\`, \`!checkuser\`, \`!listusers\`.`, PURPLE)] });
+        }
+
+        // !admin remove <@user or ID>
+        if (sub === "remove") {
+            const targetId = parseUserId(args[1]);
+            if (!targetId)
+                return msg.reply("Usage: `!admin remove <@user or user ID>`");
+            const admins = await getAdmins();
+            if (!admins.includes(targetId))
+                return msg.reply({ embeds: [embed("Not Found", `<@${targetId}> is not an admin.`, RED)] });
+            await setAdmins(admins.filter(id => id !== targetId));
+            return msg.reply({ embeds: [embed("🗑️ Admin Removed", `<@${targetId}> no longer has admin access.`, YELLOW)] });
+        }
+
+        return msg.reply("Usage: `!admin add/remove/list <@user or ID>`");
     },
 
     // !help
     help: async (msg) => {
-        return msg.reply({ embeds: [embed("📖 Commands", [
-            "`!adduser <user> <pass>` — add a user",
-            "`!removeuser <user>` — permanently remove a user",
-            "`!setpass <user> <pass>` — change a password",
-            "`!deactivate <user>` — block login without deleting",
-            "`!activate <user>` — re-enable a deactivated user",
-            "`!listusers` — list all users with status",
-            "`!checkuser <user>` — check if a user can log in",
-            "`!showpass <user>` — DMs you their password",
-        ].join("\n"), BLUE)] });
+        const admin = await canManage(msg.author.id);
+        const owner = isOwner(msg.author.id);
+        const lines = [];
+
+        if (admin) {
+            lines.push("**Whitelist Commands**");
+            lines.push("`!adduser <user> <pass>` — whitelist a user");
+            lines.push("`!removeuser <user>` — remove a user");
+            lines.push("`!checkuser <user>` — check if a user exists");
+            lines.push("`!listusers` — list all whitelisted users");
+        }
+        if (owner) {
+            lines.push("");
+            lines.push("**Owner Only**");
+            lines.push("`!setpass <user> <newpass>` — change a password");
+            lines.push("`!admin add <@user>` — give someone admin access");
+            lines.push("`!admin remove <@user>` — remove admin access");
+            lines.push("`!admin list` — show all admins");
+        }
+        if (!admin && !owner) {
+            lines.push("You don't have permission to use any commands.");
+        }
+
+        return msg.reply({ embeds: [embed("📖 Commands", lines.join("\n"), BLUE)] });
     },
 };
 
@@ -216,8 +259,7 @@ const client = new Client({
 });
 
 client.on("messageCreate", async msg => {
-    if (msg.author.bot)             return;
-    if (msg.author.id !== OWNER_ID) return;
+    if (msg.author.bot) return;
     if (!msg.content.startsWith("!")) return;
 
     const parts   = msg.content.slice(1).trim().split(/\s+/);
